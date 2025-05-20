@@ -4,111 +4,289 @@ from langgraph.store.memory import InMemoryStore
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import StateGraph, MessagesState, START, END
 from langchain_core.runnables.config import RunnableConfig
-from langchain_core.messages import SystemMessage
-from typing import List
-from pydantic import BaseModel, Field
+from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import merge_message_runs
 from trustcall import create_extractor
-
-
-class UserProfile(BaseModel):
-    """Profile of a user"""
-
-    user_name: str = Field(description="The user's preferred name")
-    user_location: str = Field(description="The user's location")
-    interests: list = Field(description="A list of the user's interests")
+from app.graph.spy import Spy
+from app.graph.utils import extract_tool_info
+from app.graph.graph_state import UpdateMemory, Profile, todo
+from datetime import datetime
+import uuid
 
 
 model = ChatOpenAI(model="gpt-4o")
-model_with_structure = model.with_structured_output(UserProfile)
-
-trust_call_extractor = create_extractor(
-    model, tools=[UserProfile], tool_choice="UserProfile"
-)
 
 
-MODEL_SYSTEM_MESSAGE = """You are a helpful assistant with memory that provides information about the user. 
-If you have memory for this user, use it to personalize your responses.
-Here is the memory (it may be empty): {memory}"""
+MODEL_SYSTEM_MESSAGE = """You are a helpful chatbot. 
 
-CREATE_MEMORY_INSTRUCTION = """"You are collecting information about the user to personalize your responses.
+You are designed to be a companion to a user, helping them keep track of their todo list.
 
-CURRENT USER INFORMATION:
-{memory}
+You have a long term memory which keeps track of three things:
+1. The user's profile (general information about them) 
+2. The user's todo list
+3. General instructions for updating the todo list
 
-INSTRUCTIONS:
-1. Review the chat history below carefully
-2. Identify new information about the user, such as:
-   - Personal details (name, location)
-   - Preferences (likes, dislikes)
-   - Interests and hobbies
-   - Past experiences
-   - Goals or future plans
-3. Merge any new information with existing memory
-4. Format the memory as a clear, bulleted list
-5. If new information conflicts with existing memory, keep the most recent version
+Here is the current User Profile (may be empty if no information has been collected yet):
+<user_profile>
+{user_profile}
+</user_profile>
 
-Remember: Only include factual information directly stated by the user. Do not make assumptions or inferences.
+Here is the current todo List (may be empty if no tasks have been added yet):
+<todo>
+{todo}
+</todo>
 
-Based on the chat history below, please update the user information:"""
+Here are the current user-specified preferences for updating the todo list (may be empty if no preferences have been specified yet):
+<instructions>
+{instructions}
+</instructions>
 
-TRUSTCALL_INSTRUCTION = """Create or update the memory (JSON doc) to incorporate information from the following conversation:"""
+Here are your instructions for reasoning about the user's messages:
+
+1. Reason carefully about the user's messages as presented below. 
+
+2. Decide whether any of the your long-term memory should be updated:
+- If personal information was provided about the user, update the user's profile by calling UpdateMemory tool with type `user`
+- If tasks are mentioned, update the todo list by calling UpdateMemory tool with type `todo`
+- If the user has specified preferences for how to update the todo list, update the instructions by calling UpdateMemory tool with type `instructions`
+
+3. Tell the user that you have updated your memory, if appropriate:
+- Do not tell the user you have updated the user's profile
+- Tell the user them when you update the todo list
+- Do not tell the user that you have updated instructions
+
+4. Err on the side of updating the todo list. No need to ask for explicit permission.
+
+5. Respond naturally to user user after a tool call was made to save memories, or if no tool call was made."""
 
 
-def call_model(state: MessagesState, config: RunnableConfig, store: BaseStore):
-    """Load memory from the store and use it to personalize the chatbot's response."""
+TRUSTCALL_INSTRUCTION = """Reflect on following interaction. 
 
+Use the provided tools to retain any necessary memories about the user. 
+
+Use parallel tool calling to handle updates and insertions simultaneously.
+
+System Time: {time}"""
+
+CREATE_INSTRUCTIONS = """Reflect on the following interaction.
+
+Based on this interaction, update your instructions for how to update todo list items. Use any feedback from the user to update how they like to have items added, etc.
+
+Your current instructions are:
+
+<current_instructions>
+{current_instructions}
+</current_instructions>"""
+
+
+def task_master(state: MessagesState, config: RunnableConfig, store: BaseStore):
     user_id = config["configurable"]["user_id"]
 
-    namespace = ("memory", user_id)
-    existing_memory = store.get(namespace, "user_memory")
-
-    if existing_memory and existing_memory.value:
-        memory_dict = existing_memory.value
-        formatted_memory = (
-            f"Name: {memory_dict.get('user_name', 'Unknown')}\n"
-            f"Location: {memory_dict.get('user_location', 'Unknown')}\n"
-            f"Interests: {', '.join(memory_dict.get('interests', []))}"
-        )
+    namespace = ("profile", user_id)
+    memories = store.search(namespace)
+    if memories:
+        user_profile = memories[0].value
     else:
-        formatted_memory = None
+        user_profile = None
 
-    system_msg = MODEL_SYSTEM_MESSAGE.format(memory=formatted_memory)
+    namespace = ("todo", user_id)
+    memories = store.search(namespace)
+    todo = "\n".join(f"{mem.value}" for mem in memories)
 
-    response = model.invoke([SystemMessage(content=system_msg)] + state["messages"])
+    namespace = ("instructions", user_id)
+    memories = store.search(namespace)
+    if memories:
+        instructions = memories[0].value
+    else:
+        instructions = ""
 
-    return {"messages": response}
+    system_msg = MODEL_SYSTEM_MESSAGE.format(
+        user_profile=user_profile, todo=todo, instructions=instructions
+    )
+
+    response = model.bind_tools([UpdateMemory], parallel_tool_calls=False).invoke(
+        [SystemMessage(content=system_msg)] + state["messages"]
+    )
+
+    return {"messages": [response]}
 
 
-def write_memory(state: MessagesState, config: RunnableConfig, store: BaseStore):
-    """Reflect on the chat history and save a memory to the store."""
+def route_message(state: MessagesState, config: RunnableConfig, store: BaseStore):
+    message = state["messages"][-1]
+    if len(message.tool_calls) == 0:
+        return END
+    else:
+        tool_call = message.tool_calls[0]
+        if tool_call["args"]["update_type"] == "user":
+            return "update_profile"
+        elif tool_call["args"]["update_type"] == "todo":
+            return "update_todo"
+        elif tool_call["args"]["update_type"] == "instructions":
+            return "update_instructions"
+        else:
+            raise ValueError
+
+
+def update_profile(state: MessagesState, config: RunnableConfig, store: BaseStore):
+    user_id = config["configurable"]["user_id"]
+
+    namespace = ("profile", user_id)
+
+    existing_items = store.search(namespace)
+
+    tool_name = "Profile"
+    existing_memories = (
+        [
+            (existing_item.key, tool_name, existing_item.value)
+            for existing_item in existing_items
+        ]
+        if existing_items
+        else None
+    )
+
+    TRUSTCALL_INSTRUCTION_FORMATTED = TRUSTCALL_INSTRUCTION.format(
+        time=datetime.now().isoformat()
+    )
+    updated_messages = list(
+        merge_message_runs(
+            messages=[SystemMessage(content=TRUSTCALL_INSTRUCTION_FORMATTED)]
+            + state["messages"][:-1]
+        )
+    )
+
+    profile_extractor = create_extractor(
+        model,
+        tools=[Profile],
+        tool_choice="Profile",
+    )
+    result = profile_extractor.invoke(
+        {"messages": updated_messages, "existing": existing_memories}
+    )
+
+    for r, rmeta in zip(result["responses"], result["response_metadata"]):
+        store.put(
+            namespace,
+            rmeta.get("json_doc_id", str(uuid.uuid4())),
+            r.model_dump(mode="json"),
+        )
+    tool_calls = state["messages"][-1].tool_calls
+    return {
+        "messages": [
+            {
+                "role": "tool",
+                "content": "updated profile",
+                "tool_call_id": tool_calls[0]["id"],
+            }
+        ]
+    }
+
+
+def update_todo(state: MessagesState, config: RunnableConfig, store: BaseStore):
+    """Reflect on the chat history and update the memory collection."""
 
     user_id = config["configurable"]["user_id"]
 
-    namespace = ("memory", user_id)
-    existing_memory = store.get(namespace, "user_memory")
+    namespace = ("todo", user_id)
 
-    existing_profile = (
-        {"UserProfile": existing_memory.value} if existing_memory else None
+    existing_items = store.search(namespace)
+
+    tool_name = "todo"
+    existing_memories = (
+        [
+            (existing_item.key, tool_name, existing_item.value)
+            for existing_item in existing_items
+        ]
+        if existing_items
+        else None
     )
-    result = trust_call_extractor.invoke(
-        {
-            "messages": [SystemMessage(content=TRUSTCALL_INSTRUCTION)]
-            + state["messages"],
-            "existing": existing_profile,
-        }
+
+    TRUSTCALL_INSTRUCTION_FORMATTED = TRUSTCALL_INSTRUCTION.format(
+        time=datetime.now().isoformat()
     )
-    updated_profile = result["responses"][0].model_dump()
-    print(updated_profile, "Updated Profile")
-    key = "user_memory"
-    store.put(namespace, key, updated_profile)
+    updated_messages = list(
+        merge_message_runs(
+            messages=[SystemMessage(content=TRUSTCALL_INSTRUCTION_FORMATTED)]
+            + state["messages"][:-1]
+        )
+    )
+
+    spy = Spy()
+
+    todo_extractor = create_extractor(
+        model, tools=[todo], tool_choice=tool_name, enable_inserts=True
+    ).with_listeners(on_end=spy)
+
+    result = todo_extractor.invoke(
+        {"messages": updated_messages, "existing": existing_memories}
+    )
+
+    for r, rmeta in zip(result["responses"], result["response_metadata"]):
+        store.put(
+            namespace,
+            rmeta.get("json_doc_id", str(uuid.uuid4())),
+            r.model_dump(mode="json"),
+        )
+
+    tool_calls = state["messages"][-1].tool_calls
+
+    todo_update_msg = extract_tool_info(spy.called_tools, tool_name)
+    print(todo_update_msg)
+    return {
+        "messages": [
+            {
+                "role": "tool",
+                "content": todo_update_msg,
+                "tool_call_id": tool_calls[0]["id"],
+            }
+        ]
+    }
+
+
+def update_instructions(state: MessagesState, config: RunnableConfig, store: BaseStore):
+    user_id = config["configurable"]["user_id"]
+
+    namespace = ("instructions", user_id)
+
+    existing_memory = store.get(namespace, "user_instructions")
+
+    system_msg = CREATE_INSTRUCTIONS.format(
+        current_instructions=existing_memory.value if existing_memory else None
+    )
+    new_memory = model.invoke(
+        [SystemMessage(content=system_msg)]
+        + state["messages"][:-1]
+        + [
+            HumanMessage(
+                content="Please update the instructions based on the conversation"
+            )
+        ]
+    )
+
+    key = "user_instructions"
+    store.put(namespace, key, {"memory": new_memory.content})
+    tool_calls = state["messages"][-1].tool_calls
+    return {
+        "messages": [
+            {
+                "role": "tool",
+                "content": "updated instructions",
+                "tool_call_id": tool_calls[0]["id"],
+            }
+        ]
+    }
 
 
 builder = StateGraph(MessagesState)
-builder.add_node("call_model", call_model)
-builder.add_node("write_memory", write_memory)
-builder.add_edge(START, "call_model")
-builder.add_edge("call_model", "write_memory")
-builder.add_edge("write_memory", END)
+builder.add_node(task_master)
+builder.add_node(update_todo)
+builder.add_node(update_profile)
+builder.add_node(update_instructions)
+
+builder.add_edge(START, "task_master")
+builder.add_conditional_edges("task_master", route_message)
+builder.add_edge("update_todo", "task_master")
+builder.add_edge("update_profile", "task_master")
+builder.add_edge("update_instructions", "task_master")
 
 across_thread_memory = InMemoryStore()
 
